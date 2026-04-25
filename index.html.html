@@ -254,6 +254,7 @@ body{font-family:"DM Sans",sans-serif;background:var(--bg);color:var(--espresso)
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <input type="date" id="filter-fecha" style="padding:7px 10px;border:1.5px solid var(--border);border-radius:7px;font-size:13px;font-family:DM Sans,sans-serif;color:var(--espresso)" oninput="renderTurnos()"/>
         <button class="btn btn-outline btn-sm" onclick="document.getElementById('filter-fecha').value='';renderTurnos()">Ver todos</button>
+        <button class="btn btn-danger btn-sm" onclick="limpiarTodosTurnos()">&#128465; Limpiar todos los turnos</button>
       </div>
     </div>
     <div id="turnos-table-wrap"></div>
@@ -1015,6 +1016,30 @@ function exportarExcel(){
       var a=document.createElement("a");a.href=url;a.download="Sevilla_Reporte_"+nowDate()+".csv";a.click();
       toast("Reporte exportado");
     });
+  });
+}
+
+/* == LIMPIAR TURNOS == */
+function limpiarTodosTurnos(){
+  if(!confirm("Esto borrara TODOS los turnos y despachos permanentemente. Continuar?"))return;
+  setSyncing(true);
+  var batch = db.batch();
+  var p1 = db.collection("turnos").get().then(function(snap){
+    snap.forEach(function(d){batch.delete(db.collection("turnos").doc(d.id));});
+  });
+  var p2 = db.collection("despachos").get().then(function(snap){
+    snap.forEach(function(d){batch.delete(db.collection("despachos").doc(d.id));});
+  });
+  Promise.all([p1,p2]).then(function(){
+    return batch.commit();
+  }).then(function(){
+    setSyncing(false);
+    _turnos=[];
+    renderTurnos();
+    toast("Todos los turnos y despachos eliminados");
+  }).catch(function(e){
+    setSyncing(false);
+    toast("Error al limpiar: "+e.message);
   });
 }
 
