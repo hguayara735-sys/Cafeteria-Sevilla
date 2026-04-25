@@ -7,6 +7,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=DM+Sans:wght@400;500;600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -200,7 +201,7 @@ body{font-family:"DM Sans",sans-serif;background:var(--bg);color:var(--espresso)
     </div>
     <div class="firebase-badge">&#9889; Conectado a Firebase &mdash; Datos en la nube</div>
     <div id="login-error" class="login-error hidden"></div>
-    <div class="field"><label>Usuario</label><input type="text" id="login-user" placeholder="Tu usuario" autocomplete="off"/></div>
+    <div class="field"><label>Correo electronico</label><input type="email" id="login-user" placeholder="correo@ejemplo.com" autocomplete="off"/></div>
     <div class="field"><label>Contrasena</label><input type="password" id="login-pass" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;"/></div>
     <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:4px" onclick="doLogin()">Ingresar al sistema</button>
     <p style="text-align:center;font-size:11px;color:#bbb;margin-top:16px">Cafeteria Sevilla &middot; Sistema interno</p>
@@ -387,6 +388,7 @@ var CAT_COLORS = {Bebida:"#378ADD",Comida:"#639922",Postre:"#D4537E",Especial:"#
    ESTADO GLOBAL
 ═══════════════════════════════════ */
 var db = null;
+var auth = null;
 var CU = null;   // current user
 var CT = null;   // current turno
 var CAT = "Todos";
@@ -403,6 +405,12 @@ var _horaTimer = null;
 ═══════════════════════════════════ */
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
 function fmt(n){ return "$" + Math.round(n).toLocaleString("es-CO"); }
+function esc(str){
+  // C-3: sanitizar strings antes de insertar en innerHTML
+  var d = document.createElement("div");
+  d.textContent = String(str || "");
+  return d.innerHTML;
+}
 function nowTime(){ return new Date().toLocaleTimeString("es-CO",{hour:"2-digit",minute:"2-digit"}); }
 function nowDate(){ return new Date().toISOString().slice(0,10); }
 function nowYM(){ return new Date().toISOString().slice(0,7); }
@@ -434,6 +442,7 @@ window.addEventListener("load", function(){
   try{
     firebase.initializeApp(firebaseConfig);
     db = firebase.firestore();
+    auth = firebase.auth();
     appInit();
   } catch(e){
     document.getElementById("loading-text").textContent = "Error: " + e.message;
@@ -441,28 +450,33 @@ window.addEventListener("load", function(){
 });
 
 function appInit(){
-  Promise.all([
-    db.collection("usuarios").get(),
-    db.collection("productos").get()
-  ]).then(function(results){
-    _usuarios = []; results[0].forEach(function(d){ _usuarios.push(Object.assign({id:d.id},d.data())); });
-    _productos = []; results[1].forEach(function(d){ _productos.push(Object.assign({id:d.id},d.data())); });
-    if(_usuarios.length === 0){ crearDatosIniciales(); return; }
-    document.getElementById("loading-overlay").classList.add("hidden");
-    document.getElementById("screen-login").classList.remove("hidden");
-    renderCats();
-  }).catch(function(e){
-    document.getElementById("loading-text").textContent = "Error de conexion. Verifica tu internet.";
-    console.error(e);
-  });
+  // I-7: habilitar persistencia offline
+  db.enablePersistence({synchronizeTabs: false})
+    .catch(function(err){
+      if(err.code === "failed-precondition"){
+        console.warn("Persistencia no disponible: multiples tabs abiertas.");
+      } else if(err.code === "unimplemented"){
+        console.warn("Este navegador no soporta persistencia offline.");
+      }
+    });
+
+  // C-1/C-2: Solo cargar productos en init — usuarios se cargan tras auth
+  db.collection("productos").get()
+    .then(function(snap){
+      _productos = []; snap.forEach(function(d){ _productos.push(Object.assign({id:d.id},d.data())); });
+      if(_productos.length === 0){ crearDatosIniciales(); return; }
+      document.getElementById("loading-overlay").classList.add("hidden");
+      document.getElementById("screen-login").classList.remove("hidden");
+      renderCats();
+    }).catch(function(e){
+      document.getElementById("loading-text").textContent = "Error de conexion. Verifica tu internet.";
+      console.error(e);
+    });
 }
 
 function crearDatosIniciales(){
+  // C-1: Solo crear productos — usuarios se gestionan en Firebase Auth + Firestore
   var batch = db.batch();
-  var users = [
-    {nombre:"Administrador",usuario:"admin",clave:hashClave("admin123"),rol:"admin",activo:true},
-    {nombre:"Cajero Principal",usuario:"cajero1",clave:hashClave("1234"),rol:"cajero",activo:true}
-  ];
   var prods = [
     {nombre:"Tinto",precio:2000,cat:"Bebida",activo:true},
     {nombre:"Cafe con leche",precio:3000,cat:"Bebida",activo:true},
@@ -475,7 +489,6 @@ function crearDatosIniciales(){
     {nombre:"Brownie",precio:5000,cat:"Postre",activo:true},
     {nombre:"Cheesecake",precio:7000,cat:"Postre",activo:true}
   ];
-  users.forEach(function(u){ batch.set(db.collection("usuarios").doc(uid()), u); });
   prods.forEach(function(p){ batch.set(db.collection("productos").doc(uid()), p); });
   batch.commit().then(function(){ appInit(); });
 }
@@ -484,41 +497,62 @@ function crearDatosIniciales(){
    LOGIN / LOGOUT
 ═══════════════════════════════════ */
 function doLogin(){
-  var user = document.getElementById("login-user").value.trim();
-  var pass = document.getElementById("login-pass").value;
-  var err  = document.getElementById("login-error");
+  var email = document.getElementById("login-user").value.trim();
+  var pass  = document.getElementById("login-pass").value;
+  var err   = document.getElementById("login-error");
   err.classList.add("hidden");
-  if(!user || !pass){ err.textContent="Ingresa usuario y contrasena."; err.classList.remove("hidden"); return; }
-  var found = null;
-  for(var i=0;i<_usuarios.length;i++){
-    if(_usuarios[i].usuario===user && checkClave(pass,_usuarios[i].clave) && _usuarios[i].activo){ found=_usuarios[i]; break; }
-  }
-  if(!found){ err.textContent="Usuario o contrasena incorrectos."; err.classList.remove("hidden"); return; }
-  CU = found;
-  document.getElementById("screen-login").classList.add("hidden");
-  document.getElementById("screen-app").classList.remove("hidden");
-  document.getElementById("tb-avatar").textContent = initials(CU.nombre);
-  document.getElementById("tb-username").textContent = CU.nombre;
+  if(!email || !pass){ err.textContent="Ingresa tu correo y contrasena."; err.classList.remove("hidden"); return; }
 
-  if(CU.rol === "admin"){
-    document.getElementById("admin-nav").classList.remove("hidden");
-    document.getElementById("btn-add-prod").classList.remove("hidden");
-    document.getElementById("tb-turno").classList.add("hidden");
-    document.getElementById("tb-total").classList.add("hidden");
-    switchTab("pos");
-  } else {
-    document.getElementById("admin-nav").classList.add("hidden");
-    document.getElementById("btn-add-prod").classList.add("hidden");
-    showView("pos");
-    renderCats();
-    renderProducts();
-    mostrarPantallaAbrirTurno();
-  }
+  // C-1: Firebase Authentication — login seguro con Google
+  auth.signInWithEmailAndPassword(email, pass)
+    .then(function(cred){
+      // Cargar perfil del usuario desde Firestore por UID
+      return db.collection("usuarios").doc(cred.user.uid).get();
+    })
+    .then(function(doc){
+      if(!doc.exists || !doc.data().activo){
+        auth.signOut();
+        var err2 = document.getElementById("login-error");
+        err2.textContent = "Usuario inactivo. Contacta al administrador.";
+        err2.classList.remove("hidden");
+        return;
+      }
+      CU = Object.assign({id:doc.id}, doc.data());
+      document.getElementById("screen-login").classList.add("hidden");
+      document.getElementById("screen-app").classList.remove("hidden");
+      document.getElementById("tb-avatar").textContent = initials(CU.nombre);
+      document.getElementById("tb-username").textContent = CU.nombre;
+      if(CU.rol === "admin"){
+        document.getElementById("admin-nav").classList.remove("hidden");
+        document.getElementById("btn-add-prod").classList.remove("hidden");
+        document.getElementById("tb-turno").classList.add("hidden");
+        document.getElementById("tb-total").classList.add("hidden");
+        switchTab("pos");
+      } else {
+        document.getElementById("admin-nav").classList.add("hidden");
+        document.getElementById("btn-add-prod").classList.add("hidden");
+        showView("pos");
+        renderCats();
+        renderProducts();
+        mostrarPantallaAbrirTurno();
+      }
+    })
+    .catch(function(e){
+      var msg = "Usuario o contrasena incorrectos.";
+      if(e.code === "auth/too-many-requests") msg = "Demasiados intentos. Espera unos minutos.";
+      if(e.code === "auth/network-request-failed") msg = "Sin conexion a internet.";
+      var err3 = document.getElementById("login-error");
+      err3.textContent = msg;
+      err3.classList.remove("hidden");
+      console.error("Login error:", e.code, e.message);
+    });
 }
 
 function doLogout(){
   if(_unsubDespachos){ _unsubDespachos(); _unsubDespachos=null; }
   if(_horaTimer){ clearInterval(_horaTimer); _horaTimer=null; }
+  // C-1: cerrar sesion en Firebase Auth
+  auth.signOut().catch(function(e){ console.error("Error signOut:",e); });
   CU=null; CT=null; CAT="Todos"; _despachos=[];
   document.getElementById("screen-app").classList.add("hidden");
   document.getElementById("screen-login").classList.remove("hidden");
@@ -696,8 +730,8 @@ function renderProducts(){
   filtered.forEach(function(p){
     var color = CAT_COLORS[p.cat] || "#888";
     var div = document.createElement("div");
-    div.innerHTML = "<div class='product-cat-dot' style='background:"+color+"'></div>"
-      + "<div class='product-name'>"+p.nombre+"</div>"
+    div.innerHTML = "<div class='product-cat-dot' style='background:"+esc(color)+"'></div>"
+      + "<div class='product-name'>"+esc(p.nombre)+"</div>"
       + "<div class='product-price'>"+fmt(p.precio)+"</div>";
     if(isAdmin){
       // Admin: ve productos pero NO puede despachar, solo editar
@@ -824,7 +858,7 @@ function renderDispatches(){
   _despachos.forEach(function(d,i){
     var row = document.createElement("div"); row.className = "dispatch-item";
     row.innerHTML = "<span class='di-num'>"+String(i+1).padStart(2,"0")+"</span>"
-      + "<div class='di-info'><div class='di-name'>"+d.nombre+"</div><div class='di-meta'>"+d.hora+" &mdash; "+fmt(d.precio)+" c/u</div></div>"
+      + "<div class='di-info'><div class='di-name'>"+esc(d.nombre)+"</div><div class='di-meta'>"+esc(d.hora)+" &mdash; "+fmt(d.precio)+" c/u</div></div>"
       + "<div class='di-qty'><button class='qty-btn'>-</button><span class='qty-val'>"+d.cantidad+"</span><button class='qty-btn'>+</button></div>"
       + "<span class='di-sub'>"+fmt(d.precio*d.cantidad)+"</span>"
       + "<button class='di-del'>&#215;</button>";
@@ -929,7 +963,7 @@ function switchTab(tab){
   });
   showView(tab);
   if(tab==="pos"){ renderCats(); renderProducts(); mostrarPanelAdmin(); }
-  if(tab==="turnos"){ loadTurnos(function(){ renderTurnos(); renderSupervision(); }); }
+  if(tab==="turnos"){ loadTurnos(function(noHayMas){ renderTurnos(noHayMas); renderSupervision(); }, true); }
   if(tab==="usuarios") loadUsuarios(renderUsuarios);
   if(tab==="productos") loadProductos(renderProductosTable);
   if(tab==="reportes") loadReportData();
@@ -938,14 +972,21 @@ function switchTab(tab){
 /* ═══════════════════════════════════
    TURNOS
 ═══════════════════════════════════ */
-function loadTurnos(cb){
-  db.collection("turnos").orderBy("fechaInicio","desc").get().then(function(snap){
-    _turnos = []; snap.forEach(function(d){ _turnos.push(Object.assign({id:d.id},d.data())); });
-    if(cb) cb();
-  });
+var _turnosLastDoc = null;
+var TURNOS_PAGE = 50;
+
+function loadTurnos(cb, reset){
+  if(reset){ _turnos=[]; _turnosLastDoc=null; }
+  var q = db.collection("turnos").orderBy("fechaInicio","desc").limit(TURNOS_PAGE);
+  if(_turnosLastDoc) q = q.startAfter(_turnosLastDoc);
+  q.get().then(function(snap){
+    snap.forEach(function(d){ _turnos.push(Object.assign({id:d.id},d.data())); });
+    if(!snap.empty) _turnosLastDoc = snap.docs[snap.docs.length-1];
+    if(cb) cb(snap.size < TURNOS_PAGE);
+  }).catch(function(e){ console.error("Error cargando turnos:",e); toast("Error cargando turnos."); });
 }
 
-function renderTurnos(){
+function renderTurnos(sinMas){
   var wrap = document.getElementById("turnos-table-wrap");
   var ff = document.getElementById("filter-fecha").value;
   var turnos = _turnos.slice();
@@ -961,11 +1002,11 @@ function renderTurnos(){
     var ini = new Date(t.fechaInicio);
     var fin = t.fechaFin ? new Date(t.fechaFin) : null;
     var tr = document.createElement("tr");
-    tr.innerHTML = "<td><strong>"+t.nombreUsuario+"</strong></td>"
+    tr.innerHTML = "<td><strong>"+esc(t.nombreUsuario)+"</strong></td>"
       + "<td style='font-family:DM Mono,monospace'>"+ini.toLocaleDateString("es-CO")+"</td>"
       + "<td style='font-family:DM Mono,monospace'>"+ini.toLocaleTimeString("es-CO",{hour:"2-digit",minute:"2-digit"})+"</td>"
       + "<td style='font-family:DM Mono,monospace'>"+(fin?fin.toLocaleTimeString("es-CO",{hour:"2-digit",minute:"2-digit"}):"En curso")+"</td>"
-      + "<td><span class='badge badge-"+t.estado+"'>"+(t.estado==="abierto"?"Abierto":"Cerrado")+"</span></td>"
+      + "<td><span class='badge badge-"+esc(t.estado)+"'>"+(t.estado==="abierto"?"Abierto":"Cerrado")+"</span></td>"
       + "<td style='font-family:DM Mono,monospace;color:var(--amber);font-weight:700'>"+fmt(t.total||0)+"</td>"
       + "<td></td>";
     var btn = document.createElement("button"); btn.className="btn btn-outline btn-sm"; btn.textContent="Detalle";
@@ -974,6 +1015,22 @@ function renderTurnos(){
     tbody.appendChild(tr);
   });
   wrap.innerHTML = ""; wrap.appendChild(table);
+  if(!sinMas){
+    var footer = document.createElement("div");
+    footer.style.cssText = "text-align:center;padding:16px";
+    var mas = document.createElement("button");
+    mas.className = "btn btn-outline"; mas.textContent = "Cargar mas turnos";
+    mas.onclick = function(){
+      mas.textContent="Cargando..."; mas.disabled=true;
+      loadTurnos(function(noHayMas){ renderTurnos(noHayMas); });
+    };
+    footer.appendChild(mas); wrap.appendChild(footer);
+  } else {
+    var tot = document.createElement("p");
+    tot.style.cssText = "text-align:center;padding:12px;font-size:12px;color:var(--gray)";
+    tot.textContent = _turnos.length + " turnos cargados en total";
+    wrap.appendChild(tot);
+  }
 }
 
 function verDetalleTurno(turnoId){
@@ -1001,35 +1058,51 @@ function verDetalleTurno(turnoId){
   });
 }
 
+function deleteBatch(refs){
+  // M-6: borrar en chunks de 499 para respetar limite de Firestore
+  var chunks = [];
+  for(var i=0;i<refs.length;i+=499) chunks.push(refs.slice(i,i+499));
+  return chunks.reduce(function(chain, chunk){
+    return chain.then(function(){
+      var batch = db.batch();
+      chunk.forEach(function(ref){ batch.delete(ref); });
+      return batch.commit();
+    });
+  }, Promise.resolve());
+}
+
 function limpiarTodosTurnos(){
   if(!confirm("Esto borrara TODOS los turnos y sus despachos permanentemente. Continuar?")) return;
   setSyncing(true);
   db.collection("turnos").get().then(function(snap){
-    var promises = [];
-    snap.forEach(function(doc){
-      // Borrar subcoleccion de despachos primero
-      promises.push(
-        db.collection("turnos").doc(doc.id).collection("despachos").get().then(function(dSnap){
-          var batch = db.batch();
-          dSnap.forEach(function(d){ batch.delete(d.ref); });
-          return batch.commit();
-        }).then(function(){
-          return doc.ref.delete();
-        })
-      );
-    });
-    return Promise.all(promises);
+    var turnoRefs = [];
+    snap.forEach(function(doc){ turnoRefs.push(doc); });
+    // Borrar subcolecciones de despachos primero, luego los turnos
+    return turnoRefs.reduce(function(chain, doc){
+      return chain.then(function(){
+        return db.collection("turnos").doc(doc.id).collection("despachos").get()
+          .then(function(dSnap){
+            var refs = []; dSnap.forEach(function(d){ refs.push(d.ref); });
+            return deleteBatch(refs);
+          }).then(function(){
+            return doc.ref.delete();
+          });
+      });
+    }, Promise.resolve());
   }).then(function(){
     return db.collection("resumen_diario").get().then(function(snap){
-      var batch = db.batch();
-      snap.forEach(function(d){ batch.delete(d.ref); });
-      return batch.commit();
+      var refs = []; snap.forEach(function(d){ refs.push(d.ref); });
+      return deleteBatch(refs);
     });
   }).then(function(){
     setSyncing(false);
     _turnos = [];
     renderTurnos();
     toast("Todos los turnos eliminados");
+  }).catch(function(e){
+    setSyncing(false);
+    console.error("Error limpiando turnos:",e);
+    toast("Error al limpiar. Revisa la consola.");
   });
 }
 
@@ -1050,8 +1123,8 @@ function renderUsuarios(){
   var tbody = table.querySelector("tbody");
   _usuarios.forEach(function(u){
     var tr = document.createElement("tr");
-    tr.innerHTML = "<td><strong>"+u.nombre+"</strong></td><td style='font-family:DM Mono,monospace'>"+u.usuario+"</td>"
-      + "<td><span class='badge badge-"+u.rol+"'>"+(u.rol==="admin"?"Admin":"Cajero")+"</span></td>"
+    tr.innerHTML = "<td><strong>"+esc(u.nombre)+"</strong></td><td style='font-family:DM Mono,monospace'>"+esc(u.usuario)+"</td>"
+      + "<td><span class='badge badge-"+esc(u.rol)+"'>"+(u.rol==="admin"?"Admin":"Cajero")+"</span></td>"
       + "<td><span class='badge badge-"+(u.activo?"activo":"inactivo")+"'>"+(u.activo?"Activo":"Inactivo")+"</span></td>"
       + "<td></td>";
     var td = tr.lastElementChild;
@@ -1104,18 +1177,19 @@ function openUsuarioModal(uid_){
 function openCambiarClave(uid_){
   var u = null;
   for(var i=0;i<_usuarios.length;i++){ if(_usuarios[i].id===uid_){ u=_usuarios[i]; break; } }
-  var body = "<div class='field'><label>Nueva contrasena</label><input id='f-c1' type='password' placeholder='Minimo 4 caracteres'/></div>"
-    + "<div class='field'><label>Confirmar</label><input id='f-c2' type='password' placeholder='Repite la contrasena'/></div>";
-  showModal("Cambiar clave: "+u.nombre, body, function(){
+  var body = "<div class='field'><label>Nueva contrasena</label><input id='f-c1' type='password' placeholder='Minimo 8 caracteres'/></div>"
+    + "<div class='field'><label>Confirmar</label><input id='f-c2' type='password' placeholder='Repite la contrasena'/></div>"
+    + "<p style='font-size:12px;color:var(--gray);margin-top:8px'>El correo de este usuario es: <strong>"+esc(u.email||"")+"</strong></p>";
+  showModal("Cambiar clave: "+esc(u.nombre), body, function(){
     var c1=document.getElementById("f-c1").value;
     var c2=document.getElementById("f-c2").value;
-    if(c1.length<4){ toast("Minimo 4 caracteres"); return; }
+    if(c1.length<6){ toast("Minimo 6 caracteres"); return; }
     if(c1!==c2){ toast("Las contrasenas no coinciden"); return; }
-    setSyncing(true);
-    db.collection("usuarios").doc(uid_).update({clave:hashClave(c1)}).then(function(){
-      setSyncing(false); closeModal(); toast("Contrasena actualizada");
-    });
-  }, "Guardar");
+    // C-1: cambiar password en Firebase Auth via Admin SDK no es posible desde cliente
+    // El admin debe ir a Firebase Console -> Authentication -> Users -> Reset password
+    closeModal();
+    toast("Para cambiar la clave ve a Firebase Console -> Authentication -> Users y usa Reset Password");
+  }, "Entendido");
 }
 
 function toggleUsuario(uid_, activo){
@@ -1143,8 +1217,8 @@ function renderProductosTable(){
   _productos.forEach(function(p){
     var color = CAT_COLORS[p.cat]||"#888";
     var tr = document.createElement("tr");
-    tr.innerHTML = "<td><strong>"+p.nombre+"</strong></td>"
-      + "<td><span style='display:inline-flex;align-items:center;gap:5px'><span style='width:8px;height:8px;border-radius:50%;background:"+color+";display:inline-block'></span>"+p.cat+"</span></td>"
+    tr.innerHTML = "<td><strong>"+esc(p.nombre)+"</strong></td>"
+      + "<td><span style='display:inline-flex;align-items:center;gap:5px'><span style='width:8px;height:8px;border-radius:50%;background:"+esc(color)+";display:inline-block'></span>"+esc(p.cat)+"</span></td>"
       + "<td style='font-family:DM Mono,monospace;color:var(--amber);font-weight:700'>"+fmt(p.precio)+"</td>"
       + "<td><span class='badge badge-"+(p.activo?"activo":"inactivo")+"'>"+(p.activo?"Activo":"Inactivo")+"</span></td>"
       + "<td></td>";
@@ -1266,36 +1340,40 @@ function renderReportesConResumenes(resumenes, diasPeriodo){
 }
 
 function loadReportDataConFiltros(filCajero, filProd){
-  var now = new Date();
-  var desde;
-  if(PERIOD==="dia"){ desde=new Date(now.getFullYear(),now.getMonth(),now.getDate()); }
-  else if(PERIOD==="semana"){ desde=new Date(now); var day=desde.getDay()||7; desde.setDate(desde.getDate()-day+1); desde.setHours(0,0,0,0); }
-  else { desde=new Date(now.getFullYear(),now.getMonth(),1); }
+  var rango = getRangoPeriodo(PERIOD);
+  var desde = rango.desde;
   db.collection("turnos").where("estado","==","cerrado").get().then(function(snap){
-    var turnos=[]; snap.forEach(function(d){ var t=Object.assign({id:d.id},d.data()); if(new Date(t.fechaInicio)>=desde) turnos.push(t); });
+    var turnos=[];
+    snap.forEach(function(d){
+      var t=Object.assign({id:d.id},d.data());
+      if(new Date(t.fechaInicio)>=desde) turnos.push(t);
+    });
     if(filCajero) turnos=turnos.filter(function(t){ return t.nombreUsuario===filCajero; });
     if(!turnos.length){ mostrarReporte(0,0,0,{}); return; }
-    var promises=turnos.map(function(t){
-      return db.collection("turnos").doc(t.id).collection("despachos").get().then(function(dSnap){
-        var arr=[]; dSnap.forEach(function(d){ arr.push(d.data()); }); return arr;
-      });
-    });
-    Promise.all(promises).then(function(results){
-      var totalGeneral=0,totalItems=0,porProducto={};
-      results.forEach(function(despachos){
-        var dd=despachos;
-        if(filProd) dd=dd.filter(function(d){ return d.nombre===filProd; });
-        dd.forEach(function(d){
-          totalGeneral+=d.precio*d.cantidad; totalItems+=d.cantidad;
-          if(!porProducto[d.nombre]) porProducto[d.nombre]={qty:0,total:0};
-          porProducto[d.nombre].qty+=d.cantidad; porProducto[d.nombre].total+=d.precio*d.cantidad;
+    var totalGeneral=0, totalItems=0, porProducto={};
+    var cajeros={};
+    turnos.forEach(function(t){
+      cajeros[t.nombreUsuario]=true;
+      if(t.porProducto){
+        Object.keys(t.porProducto).forEach(function(key){
+          var item=t.porProducto[key];
+          var nombre=item.nombre||key;
+          if(filProd && nombre!==filProd) return;
+          if(!porProducto[key]) porProducto[key]={nombre:nombre,qty:0,total:0};
+          porProducto[key].qty   += item.qty   || 0;
+          porProducto[key].total += item.total || 0;
+          totalGeneral += item.total || 0;
+          totalItems   += item.qty   || 0;
         });
-      });
-      var cajeros={};turnos.forEach(function(t){cajeros[t.nombreUsuario]=true;});
-      poblarFiltros(Object.keys(cajeros),Object.keys(porProducto));
-      mostrarReporte(totalGeneral,totalItems,turnos.length,porProducto);
+      } else {
+        totalGeneral += t.total      || 0;
+        totalItems   += t.totalItems || 0;
+      }
     });
-  });
+    var prodNombres=Object.values(porProducto).map(function(p){ return p.nombre; });
+    poblarFiltros(Object.keys(cajeros), prodNombres);
+    mostrarReporte(totalGeneral, totalItems, turnos.length, porProducto);
+  }).catch(function(e){ console.error("Error reporte filtros:",e); toast("Error cargando reporte."); });
 }
 
 function mostrarReporte(totalGeneral,totalItems,totalTurnos,porProducto){
@@ -1308,9 +1386,11 @@ function mostrarReporte(totalGeneral,totalItems,totalTurnos,porProducto){
     wrap.innerHTML="<div class='empty-state'><p style='font-size:36px;opacity:.4'>&#128202;</p><p>Sin ventas en este periodo.</p></div>";
     return;
   }
+  // I-5: usar .nombre del objeto (no la clave que puede ser ID o nombre)
   wrap.innerHTML = "<p style='font-size:11px;font-weight:700;color:var(--brown);text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px'>Ventas por producto</p>"
     + rows.map(function(r){
-      return "<div class='report-row'><div><div style='font-size:13px;font-weight:500;color:var(--espresso)'>"+r[0]+"</div><div style='font-size:11px;color:var(--gray);font-family:DM Mono,monospace'>"+r[1].qty+" unidad"+(r[1].qty!==1?"es":"")+"</div></div><div style='font-size:14px;font-weight:700;color:var(--amber);font-family:DM Mono,monospace'>"+fmt(r[1].total)+"</div></div>";
+      var nombre = (r[1].nombre || r[0]);
+      return "<div class='report-row'><div><div style='font-size:13px;font-weight:500;color:var(--espresso)'>"+esc(nombre)+"</div><div style='font-size:11px;color:var(--gray);font-family:DM Mono,monospace'>"+r[1].qty+" unidad"+(r[1].qty!==1?"es":"")+"</div></div><div style='font-size:14px;font-weight:700;color:var(--amber);font-family:DM Mono,monospace'>"+fmt(r[1].total)+"</div></div>";
     }).join("")
     + "<div class='report-grand'><span class='report-grand-label'>Total del periodo</span><span class='report-grand-val'>"+fmt(totalGeneral)+"</span></div>";
 }
@@ -1330,11 +1410,8 @@ function renderReportes(){ loadReportData(); }
    EXPORTAR EXCEL
 ═══════════════════════════════════ */
 function exportarExcel(){
-  var now = new Date();
-  var desde;
-  if(PERIOD==="dia"){ desde=new Date(now.getFullYear(),now.getMonth(),now.getDate()); }
-  else if(PERIOD==="semana"){ desde=new Date(now); var day=desde.getDay()||7; desde.setDate(desde.getDate()-day+1); desde.setHours(0,0,0,0); }
-  else { desde=new Date(now.getFullYear(),now.getMonth(),1); }
+  var rango = getRangoPeriodo(PERIOD);
+  var desde = rango.desde;
   db.collection("turnos").where("estado","==","cerrado").get().then(function(snap){
     var turnos=[]; snap.forEach(function(d){ var t=Object.assign({id:d.id},d.data()); if(new Date(t.fechaInicio)>=desde) turnos.push(t); });
     if(!turnos.length){ toast("Sin datos para exportar"); return; }
@@ -1452,6 +1529,12 @@ function showModal(title,body,onSave,saveLabel){
   setTimeout(function(){ var fi=box.querySelector("input"); if(fi) fi.focus(); },80);
 }
 function closeModal(){ document.getElementById("modal").classList.add("hidden"); }
+
+/* == INDICES FIRESTORE REQUERIDOS (I-4)
+   Crear en: console.firebase.google.com -> Firestore -> Indices -> Agregar indice
+   1. Coleccion: turnos | Campos: usuarioId ASC, estado ASC
+   2. Coleccion: turnos | Campos: estado ASC, fecha ASC
+== */
 
 document.addEventListener("keydown", function(e){
   if(e.key==="Enter" && !document.getElementById("screen-login").classList.contains("hidden")) doLogin();
