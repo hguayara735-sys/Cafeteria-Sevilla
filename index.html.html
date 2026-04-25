@@ -460,21 +460,26 @@ function appInit(){
       }
     });
 
-  // C-1/C-2: Solo cargar productos en init — usuarios se cargan tras auth
+  // Mostrar login directamente — productos se cargan despues del login
+  // Las reglas de Firestore requieren auth para leer datos
+  document.getElementById("loading-overlay").classList.add("hidden");
+  document.getElementById("screen-login").classList.remove("hidden");
+}
+
+function cargarProductosTrasLogin(cb){
   db.collection("productos").get()
     .then(function(snap){
-      _productos = []; snap.forEach(function(d){ _productos.push(Object.assign({id:d.id},d.data())); });
-      if(_productos.length === 0){ crearDatosIniciales(); return; }
-      document.getElementById("loading-overlay").classList.add("hidden");
-      document.getElementById("screen-login").classList.remove("hidden");
-      renderCats();
+      _productos = [];
+      snap.forEach(function(d){ _productos.push(Object.assign({id:d.id},d.data())); });
+      if(_productos.length === 0){ crearDatosIniciales(cb); return; }
+      if(cb) cb();
     }).catch(function(e){
-      document.getElementById("loading-text").textContent = "Error de conexion. Verifica tu internet.";
-      console.error(e);
+      console.error("Error cargando productos:",e);
+      toast("Error cargando productos. Recarga la pagina.");
     });
 }
 
-function crearDatosIniciales(){
+function crearDatosIniciales(cb){
   // C-1: Solo crear productos — usuarios se gestionan en Firebase Auth + Firestore
   var batch = db.batch();
   var prods = [
@@ -490,7 +495,13 @@ function crearDatosIniciales(){
     {nombre:"Cheesecake",precio:7000,cat:"Postre",activo:true}
   ];
   prods.forEach(function(p){ batch.set(db.collection("productos").doc(uid()), p); });
-  batch.commit().then(function(){ appInit(); });
+  batch.commit().then(function(){
+    db.collection("productos").get().then(function(snap){
+      _productos = [];
+      snap.forEach(function(d){ _productos.push(Object.assign({id:d.id},d.data())); });
+      if(cb) cb();
+    });
+  });
 }
 
 /* ═══════════════════════════════════
@@ -518,24 +529,27 @@ function doLogin(){
         return;
       }
       CU = Object.assign({id:doc.id}, doc.data());
-      document.getElementById("screen-login").classList.add("hidden");
-      document.getElementById("screen-app").classList.remove("hidden");
-      document.getElementById("tb-avatar").textContent = initials(CU.nombre);
-      document.getElementById("tb-username").textContent = CU.nombre;
-      if(CU.rol === "admin"){
-        document.getElementById("admin-nav").classList.remove("hidden");
-        document.getElementById("btn-add-prod").classList.remove("hidden");
-        document.getElementById("tb-turno").classList.add("hidden");
-        document.getElementById("tb-total").classList.add("hidden");
-        switchTab("pos");
-      } else {
-        document.getElementById("admin-nav").classList.add("hidden");
-        document.getElementById("btn-add-prod").classList.add("hidden");
-        showView("pos");
-        renderCats();
-        renderProducts();
-        mostrarPantallaAbrirTurno();
-      }
+      // Cargar productos ahora que tenemos auth
+      cargarProductosTrasLogin(function(){
+        document.getElementById("screen-login").classList.add("hidden");
+        document.getElementById("screen-app").classList.remove("hidden");
+        document.getElementById("tb-avatar").textContent = initials(CU.nombre);
+        document.getElementById("tb-username").textContent = CU.nombre;
+        if(CU.rol === "admin"){
+          document.getElementById("admin-nav").classList.remove("hidden");
+          document.getElementById("btn-add-prod").classList.remove("hidden");
+          document.getElementById("tb-turno").classList.add("hidden");
+          document.getElementById("tb-total").classList.add("hidden");
+          switchTab("pos");
+        } else {
+          document.getElementById("admin-nav").classList.add("hidden");
+          document.getElementById("btn-add-prod").classList.add("hidden");
+          showView("pos");
+          renderCats();
+          renderProducts();
+          mostrarPantallaAbrirTurno();
+        }
+      });
     })
     .catch(function(e){
       var msg = "Usuario o contrasena incorrectos.";
